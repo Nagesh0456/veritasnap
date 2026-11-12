@@ -709,6 +709,77 @@ async def api_verify_media(
     return run_verification_pipeline(query_bgr, claimed_origin=claimed_origin)
 
 
+@app.get("/api/v1/health")
+async def api_health():
+    """Liveness probe used by the frontend status indicator."""
+    conn = get_db()
+    nodes = conn.execute("SELECT COUNT(*) AS c FROM media_dag_nodes").fetchone()["c"]
+    conn.close()
+    return {
+        "status": "ok",
+        "service": "VeritaSnap V2",
+        "version": app.version,
+        "signer_pubkey_hex": SIGNING_PUB_HEX,
+        "registry_nodes": int(nodes),
+    }
+
+
+@app.get("/api/v1/registry")
+async def api_registry(limit: int = 100):
+    """Flat ledger view of the provenance DAG for the dashboard."""
+    limit = max(1, min(int(limit), 500))
+    conn = get_db()
+    rows = conn.execute(
+        """
+        SELECT short_media_id, parent_media_id, hop_depth, origin_type_code, origin_label,
+               canonical_w, canonical_h, timestamp_bucket, zkp_pedersen_comm,
+               exif_scrubbed, canonical_thumb_jpg
+        FROM media_dag_nodes
+        ORDER BY rowid DESC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+    totals = conn.execute(
+        """
+        SELECT COUNT(*) AS total,
+               COALESCE(SUM(CASE WHEN parent_media_id IS NULL THEN 1 ELSE 0 END), 0) AS roots,
+               COALESCE(SUM(CASE WHEN zkp_pedersen_comm IS NOT NULL THEN 1 ELSE 0 END), 0) AS zkp
+        FROM media_dag_nodes
+        """
+    ).fetchone()
+    conn.close()
+
+    items = []
+    for r in rows:
+        thumb_b64 = base64.b64encode(r["canonical_thumb_jpg"]).decode("ascii")
+        items.append(
+            {
+                "short_media_id": r["short_media_id"],
+                "parent_media_id": r["parent_media_id"],
+                "hop_depth": int(r["hop_depth"]),
+                "origin_type_code": int(r["origin_type_code"]),
+                "origin_label": r["origin_label"],
+                "width": int(r["canonical_w"]),
+                "height": int(r["canonical_h"]),
+                "timestamp_bucket": r["timestamp_bucket"],
+                "zkp_protected": bool(r["zkp_pedersen_comm"]),
+                "exif_scrubbed": bool(r["exif_scrubbed"]),
+                "thumbnail": f"data:image/jpeg;base64,{thumb_b64}",
+            }
+        )
+
+    total = int(totals["total"])
+    roots = int(totals["roots"])
+    return {
+        "items": items,
+        "total": total,
+        "roots": roots,
+        "edits": total - roots,
+        "zkp_protected": int(totals["zkp"]),
+    }
+
+
 class ZKPClaimRequest(BaseModel):
     short_media_id: str
     author_secret_phrase: str
